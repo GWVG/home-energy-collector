@@ -1,0 +1,15 @@
+[Unit]
+Description=Home energy data collector
+After=network-online.target influxdb.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/collector
+ExecStart=/root/.local/bin/uv run collector.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

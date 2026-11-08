@@ -1,0 +1,16 @@
+# Runs on the Proxmox host itself, from a clone of this repository.
+[Unit]
+Description=Home energy collector - hardware health endpoint
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/home-energy-collector
+ExecStart=/usr/bin/python3 /opt/home-energy-collector/health_endpoint.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

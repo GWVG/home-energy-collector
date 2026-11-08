@@ -1,0 +1,22 @@
+[project]
+name = "home-energy-collector"
+version = "1.0.0"
+description = "Polls a heat pump, solar inverter, grid meter, ventilation unit and two weather sources, and writes them to InfluxDB on one shared timestamp."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "beautifulsoup4>=4.15.0",
+    "huawei-solar>=2.2.9",
+    "influxdb-client>=1.50.0",
+    "python-dotenv>=1.2.1",
+    "requests>=2.32.5",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

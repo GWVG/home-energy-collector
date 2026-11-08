@@ -1,0 +1,13 @@
+# secrets
+.env
+.netrc
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# local data
+*.csv
+*.log
