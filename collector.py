@@ -645,6 +645,32 @@ def build_points(
     return points
 
 
+def refresh_cached(
+    cache: dict | None,
+    last_attempt: float | None,
+    interval: float,
+    now: float,
+    fetch,
+    name: str,
+) -> tuple[dict | None, float | None]:
+    """Refreshes a slowly polled source at most once per `interval` seconds.
+
+    Returns the (possibly unchanged) cache and the time of the last attempt.
+    Every attempt counts, successful or not: a failing or unusable source is
+    retried after `interval`, not on every cycle. A fetch that raises, or that
+    returns None (e.g. a weather station reporting it isn't online), keeps the
+    previous cached value instead of clearing it.
+    """
+    if last_attempt is not None and now - last_attempt < interval:
+        return cache, last_attempt
+    try:
+        fresh = fetch()
+    except Exception as e:
+        log.error(f"{name} fetch failed: {e}")
+        return cache, now
+    return (fresh if fresh is not None else cache), now
+
+
 def main():
     client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
     write_api = client.write_api(write_options=SYNCHRONOUS)
@@ -652,9 +678,9 @@ def main():
     log.info(f"Collector started, interval={INTERVAL}s, bucket={INFLUX_BUCKET}")
 
     outdoor_cache: dict | None = None
-    last_outdoor_fetch = 0.0
+    last_outdoor_attempt: float | None = None
     meteobelgie_cache: dict | None = None
-    last_meteobelgie_fetch = 0.0
+    last_meteobelgie_attempt: float | None = None
 
     while True:
         ts = datetime.now(timezone.utc)
@@ -700,32 +726,20 @@ def main():
             log.error(f"Huawei fetch failed: {e}")
             huawei_raw = {}
 
-        # Open-Meteo: its own, much lower poll rate than COLLECTOR_INTERVAL
-        # (weather changes slowly, and polling a free public API every cycle
-        # would be rude). In between, the last known value is reused so every
-        # write cycle still gets an outdoor_weather point.
+        # The weather sources have their own, much lower poll rates than
+        # COLLECTOR_INTERVAL: weather changes slowly, Open-Meteo is a free
+        # public API, and MeteoBelgie is a real website not meant for
+        # machines (default once an hour). In between, the last known value
+        # is reused, so every write cycle still gets a weather point.
         now_monotonic = time.monotonic()
-        if outdoor_cache is None or (now_monotonic - last_outdoor_fetch) >= OUTDOOR_WEATHER_INTERVAL:
-            try:
-                outdoor_cache = fetch_outdoor_weather()
-                last_outdoor_fetch = now_monotonic
-            except Exception as e:
-                log.error(f"Outdoor weather fetch failed: {e}")
-                # keep using the last known value (may still be None if the
-                # very first fetch failed)
-
-        # MeteoBelgie: even more careful than Open-Meteo, as this is a real
-        # website not meant for machines. Its own, even lower poll rate
-        # (default once an hour) and the same caching approach.
-        if meteobelgie_cache is None or (now_monotonic - last_meteobelgie_fetch) >= METEOBELGIE_INTERVAL:
-            try:
-                meteobelgie_cache = fetch_meteobelgie_station()
-                last_meteobelgie_fetch = now_monotonic
-            except Exception as e:
-                log.error(f"MeteoBelgie fetch failed: {e}")
-                # keep using the last known value (may still be None if the
-                # very first fetch failed, or if the station wasn't 'Online';
-                # see fetch_meteobelgie_station())
+        outdoor_cache, last_outdoor_attempt = refresh_cached(
+            outdoor_cache, last_outdoor_attempt, OUTDOOR_WEATHER_INTERVAL,
+            now_monotonic, fetch_outdoor_weather, "Outdoor weather",
+        )
+        meteobelgie_cache, last_meteobelgie_attempt = refresh_cached(
+            meteobelgie_cache, last_meteobelgie_attempt, METEOBELGIE_INTERVAL,
+            now_monotonic, fetch_meteobelgie_station, "MeteoBelgie",
+        )
 
         if (
             not nibe_raw and not hw_raw and not duco_info_raw and not duco_nodes_raw
