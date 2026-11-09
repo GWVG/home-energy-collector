@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 Polls a NIBE heat pump, a HomeWizard P1 meter, a Duco ventilation unit, a
-Huawei SUN2000 inverter and a host-health endpoint on a fixed interval, plus
-Open-Meteo and a MeteoBelgie weather-station page on their own, much longer
-intervals. The local devices share one timestamp per cycle, so they line up
-exactly for later analysis. The weather sources carry their own observation
-time instead: a cached reading is never restamped as if it were new.
+Huawei SUN2000 inverter and a host-health endpoint every cycle, plus
+Open-Meteo and a MeteoBelgie weather-station page on their own, longer
+intervals, and writes everything to InfluxDB.
+
+Device points share one timestamp per cycle, so they line up exactly.
+Weather points carry the source's own observation time.
 
 Usage:
     uv run collector.py
@@ -19,7 +20,7 @@ import sys
 import time
 import logging
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 import requests
@@ -47,10 +48,7 @@ HW_IP = os.environ["HW_IP"]
 DUCO_IP = os.environ["DUCO_IP"]
 HEALTH_ENDPOINT_URL = os.environ["HEALTH_ENDPOINT_URL"]  # health_endpoint.py on the Proxmox host
 HUAWEI_DONGLE_IP = os.environ["HUAWEI_DONGLE_IP"]  # SDongleA, Modbus TCP port 502
-# Unit ID 0 (the SDongleA itself) does not answer on this setup; unit ID 1
-# (the SUN2000 inverter behind it) does. Hence a default of 1 instead of the
-# library default of 0. Configurable for other installations (for example
-# several inverters behind one dongle).
+# Unit 0 is the dongle itself and doesn't answer here; unit 1 is the inverter.
 HUAWEI_UNIT_ID = int(os.environ.get("HUAWEI_UNIT_ID", "1"))
 HUAWEI_TIMEOUT = int(os.environ.get("HUAWEI_TIMEOUT", "10"))  # seconds, per Modbus call
 INFLUX_URL = os.environ.get("INFLUX_URL", "http://localhost:8086")
@@ -59,89 +57,50 @@ INFLUX_ORG = os.environ["INFLUX_ORG"]
 INFLUX_BUCKET = os.environ["INFLUX_BUCKET"]
 INTERVAL = int(os.environ.get("COLLECTOR_INTERVAL", "60"))
 
-# Outdoor humidity: none of the local devices measures it (the NIBE only
-# reports outdoor temperature; Duco's weather registers need an accessory
-# that isn't installed), hence Open-Meteo as an external source.
+# None of the devices measures outdoor humidity, hence two weather sources:
+# Open-Meteo (model data) and a real station in Sint-Niklaas as a cross-check.
 OPEN_METEO_LAT = float(os.environ["OPEN_METEO_LAT"])
 OPEN_METEO_LON = float(os.environ["OPEN_METEO_LON"])
 OUTDOOR_WEATHER_INTERVAL = int(os.environ.get("OUTDOOR_WEATHER_INTERVAL", "900"))  # 15 min
 
-# MeteoBelgie: a real weather station (Davis Vantage Pro II) in Sint-Niklaas,
-# used as a cross-check against Open-Meteo's model data. This is not an API
-# but an ordinary web page, scraped because no public structured API exists.
-# Hence stricter manners than for the other sources: a very low poll rate
-# (default once an hour), an honest User-Agent (no browser impersonation),
-# and robots.txt checked (only a ?list=*&key=* query pattern is disallowed,
-# not this path).
+# MeteoBelgie has no API, so this scrapes an ordinary web page: once an hour,
+# with an honest User-Agent, on a path robots.txt allows.
 METEOBELGIE_URL = "https://www.meteobelgie.be/waarnemingen/belgie/weerstation/262/sint-niklaas-provincie-oost-vlaanderen-21m"
 METEOBELGIE_USER_AGENT = "OstdonkIntelligence/1.0 (personal project, non-commercial)"
 METEOBELGIE_INTERVAL = int(os.environ.get("METEOBELGIE_INTERVAL", "3600"))  # 1 hour
-# The station page shows its observation time in Belgian local time.
-METEOBELGIE_TZ = ZoneInfo("Europe/Brussels")
+METEOBELGIE_TZ = ZoneInfo("Europe/Brussels")  # the page shows local time
 
 
 # --- Generic flatten pipeline ---
 
 def _is_entity_map(d: dict) -> bool:
-    """Structural heuristic: a dict whose keys are ALL numeric strings is an
-    ID-keyed collection of entities (like the NIBE point list, keyed by point
-    ID) rather than a fixed record with named fields. Looks only at the shape
-    of the keys, never at their names or values.
-    """
+    """A dict whose keys are all numeric strings is a collection of entities
+    keyed by ID (like the NIBE point list), not a record with named fields."""
     return bool(d) and all(k.isdigit() for k in d)
 
 
 class ForceFieldStr(str):
-    """Marks a string leaf that must be written as an InfluxDB *field*, never
-    as a tag. An explicit, documented exception to the generic pipeline.
+    """A string leaf that to_points() writes as a field instead of a tag.
 
-    Why: to_points() turns every string leaf into a tag. That is right for
-    stable identity (serial numbers, model names) but harmful for a
-    categorical value that can change between cycles (for example Huawei's
-    device_status: "On-grid" vs "Standby"). A tag that changes value splits
-    the InfluxDB series into a separate Flux table per write, so last() no
-    longer returns one value but one row per table. The same problem as the
-    smartctl local_time.asctime bug (see _strip_smartctl_asctime()).
-
-    Usage: wrap the value before to_points(), in the source-specific
-    decoration step (see _decorate_huawei_result()). The class itself is
-    source-independent; which fields qualify stays a per-source decision.
+    For categorical values that change between cycles (Huawei's
+    device_status: "On-grid" vs "Standby"). As a tag, every new value would
+    start a new series, and last() would return one row per series instead
+    of one value.
     """
 
 
 def to_points(measurement: str, obj, ts: datetime, tags: dict[str, str] | None = None) -> list[Point]:
-    """Recursively converts an arbitrary nested JSON structure into InfluxDB
-    Points, without knowing any specific field names.
+    """Converts arbitrary nested JSON into InfluxDB Points without knowing
+    any field names. The rules look only at structure:
 
-    Rules (structural, not name-based):
-    - dict with only numeric-string keys -> ID-keyed entity collection:
-      every key/value becomes its own Point, tagged id=<key>.
-    - list -> entity collection: every element becomes its own Point, tagged
-      index=<position>; the measurement becomes "<measurement>_<path>".
-    - any other dict -> fixed record: keys are flattened into the current
-      Point (nested dicts -> joined path name, nested lists -> sub-Points as
-      above).
-    - scalar: str -> tag, bool/int/float -> field, None -> ignored.
-
-    A Point without fields (tags only) is not written: InfluxDB needs at
-    least one field per point.
+    - dict with only numeric keys -> one Point per entry, tagged id=<key>
+    - list -> one Point per element, tagged index=<position>
+    - other dict -> flattened into the current Point; nested dicts become
+      path-joined field names, nested collections become sub-measurements
+      named "<measurement>_<path>"
+    - str -> tag, bool/int/float -> field, None or "" -> ignored
     """
     tags = dict(tags or {})
-
-    if isinstance(obj, dict) and _is_entity_map(obj):
-        return [
-            p
-            for key, val in obj.items()
-            for p in to_points(measurement, val, ts, {**tags, "id": key})
-        ]
-
-    if isinstance(obj, list):
-        return [
-            p
-            for i, val in enumerate(obj)
-            for p in to_points(measurement, val, ts, {**tags, "index": str(i)})
-        ]
-
     point = Point(measurement).time(ts)
     for k, v in tags.items():
         point = point.tag(k, v)
@@ -151,19 +110,16 @@ def to_points(measurement: str, obj, ts: datetime, tags: dict[str, str] | None =
 
     def walk(node, path: tuple[str, ...]) -> None:
         nonlocal point, has_field
-        if isinstance(node, dict):
-            if _is_entity_map(node):
-                sub_measurement = "_".join((measurement, *path)).lower()
-                for key, val in node.items():
-                    sub_points.extend(to_points(sub_measurement, val, ts, {**tags, "id": key}))
-                return
+        if isinstance(node, dict) and not _is_entity_map(node):
             for k, v in node.items():
                 walk(v, path + (str(k),))
-        elif isinstance(node, list):
+        elif isinstance(node, (dict, list)):
             sub_measurement = "_".join((measurement, *path)).lower()
-            for i, val in enumerate(node):
-                sub_points.extend(to_points(sub_measurement, val, ts, {**tags, "index": str(i)}))
-        elif node is None:
+            entries = node.items() if isinstance(node, dict) else enumerate(node)
+            tag = "id" if isinstance(node, dict) else "index"
+            for key, val in entries:
+                sub_points.extend(to_points(sub_measurement, val, ts, {**tags, tag: str(key)}))
+        elif node is None or node == "":
             return
         else:
             name = "_".join(path).lower()
@@ -173,30 +129,22 @@ def to_points(measurement: str, obj, ts: datetime, tags: dict[str, str] | None =
                 point = point.field(name, node)
                 has_field = True
             elif isinstance(node, (int, float)):
-                # Always coerce to float: a JSON number can flip between int
-                # (e.g. "0") and float (e.g. "0.02") from one poll to the
-                # next, as HomeWizard's current fields do, and InfluxDB does
-                # not allow a type change on a field within a measurement.
+                # Always float: a JSON number can flip between 0 and 0.02 from
+                # one poll to the next, and InfluxDB rejects a field type change.
                 point = point.field(name, float(node))
                 has_field = True
             elif isinstance(node, ForceFieldStr):
-                # Must come before the generic str branch (ForceFieldStr is a
-                # str subclass). An empty ForceFieldStr is ignored like an
-                # empty plain string, so an empty bit field at night (e.g.
-                # Huawei's alarm_1) doesn't fail the cycle.
-                if node != "":
-                    point = point.field(name, str(node))
-                    has_field = True
-            elif isinstance(node, str) and node != "":
+                point = point.field(name, str(node))
+                has_field = True
+            elif isinstance(node, str):
                 point = point.tag(name, node)
                 leaf_tags[name] = node
 
     walk(obj, ())
     if not has_field and leaf_tags:
-        # InfluxDB doesn't accept a Point without fields. An entity with only
-        # categorical (string) data, such as a Duco subsystem with just
-        # Component/Status, would otherwise disappear silently. The same
-        # string values are therefore also written as string fields.
+        # InfluxDB needs at least one field per point. An entity with only
+        # strings (a Duco subsystem with just Component/Status) would vanish,
+        # so its strings are also written as fields.
         for k, v in leaf_tags.items():
             point = point.field(k, v)
         has_field = True
@@ -204,44 +152,26 @@ def to_points(measurement: str, obj, ts: datetime, tags: dict[str, str] | None =
     return ([point] if has_field else []) + sub_points
 
 
-def _decorate_nibe_point(raw: dict) -> dict:
-    """Adds a derived, aggregation-safe 'scaled_value' and 'is_valid' next to
-    the raw fields of one NIBE point.
+# --- Source-specific steps before the generic pipeline ---
 
-    The only NIBE-specific step in the otherwise generic pipeline:
-    -32768/isOk/divisor are a protocol-wide sentinel convention that is the
-    same for every NIBE point, not a per-point or per-name choice. The raw
-    integerValue/isOk still pass through the generic flatten, so nothing is
-    lost.
-    """
-    metadata = raw.get("metadata") or {}
+def _decorate_nibe_point(raw: dict) -> dict:
+    """Adds 'scaled_value' and 'is_valid' next to the raw fields of one NIBE
+    point. -32768, isOk and the divisor are one convention for every NIBE
+    point, so this is the only NIBE-specific step."""
     value_block = raw.get("value") or {}
     raw_int = value_block.get("integerValue")
-    is_ok = bool(value_block.get("isOk"))
-
     decorated = dict(raw)
-    if is_ok and raw_int is not None and raw_int != -32768:
-        divisor = metadata.get("divisor") or 1
-        decorated["is_valid"] = True
-        decorated["scaled_value"] = raw_int / divisor if divisor != 1 else float(raw_int)
-    else:
-        decorated["is_valid"] = False
+    decorated["is_valid"] = bool(value_block.get("isOk")) and raw_int is not None and raw_int != -32768
+    if decorated["is_valid"]:
+        divisor = (raw.get("metadata") or {}).get("divisor") or 1
+        decorated["scaled_value"] = float(raw_int) / divisor
     return decorated
 
 
 def _strip_smartctl_asctime(smart_raw: dict) -> dict:
-    """Removes smartctl's `local_time.asctime` (a human-readable timestamp
-    string, e.g. "Sat Aug 15 12:30:57 2026 CEST") before to_points(), so it
-    doesn't end up as a tag.
-
-    The string changes on every collector cycle (it's smartctl's own run
-    time, not a measurement), and the generic rule turns every string leaf
-    into a tag. A tag with a new value on nearly every write splits the
-    series into as many Flux tables as there are writes: a `last()` query
-    then returns one row per table instead of one value (328 rows over 6
-    hours in practice), which Grafana renders as a grid of separate tiles.
-    Nothing is lost: `local_time.time_t` (numeric epoch) stays as a field,
-    and every point has its own InfluxDB `_time` anyway."""
+    """Drops smartctl's `local_time.asctime`, a run-time string that would
+    become a tag with a new value every cycle (see ForceFieldStr).
+    `local_time.time_t` keeps the same information as a number."""
     if not isinstance(smart_raw, dict):
         return smart_raw
     local_time = smart_raw.get("local_time")
@@ -252,75 +182,74 @@ def _strip_smartctl_asctime(smart_raw: dict) -> dict:
     return stripped
 
 
-# --- Fetchers: each returns the raw, unfiltered API response ---
+def _clean_host_health(body: dict) -> dict:
+    """health_endpoint.py can fail one section (one drive, the storage pools)
+    without failing the request, and reports that as {"error": ...}. Those
+    sections are dropped: an error is never written as data."""
+    return {
+        section: _strip_smartctl_asctime(data)
+        for section, data in body.items()
+        if not (isinstance(data, dict) and "error" in data)
+    }
 
-def fetch_nibe() -> dict:
-    """Fetches the complete, raw NIBE point list (device 0).
 
-    Auth via ~/.netrc (machine = NIBE_HOST): requests picks this up
-    automatically as long as no explicit auth= is passed (trust_env=True is
-    the default). Self-signed NIBE certificate -> verify=False.
-    """
-    url = f"https://{NIBE_HOST}:8443/api/v1/devices/0/points"
-    resp = requests.get(url, verify=False, timeout=10)
+# Huawei status and bit-field registers that change value, so they are
+# written as fields (see ForceFieldStr). Model, serial and firmware stay tags.
+_HUAWEI_FORCE_FIELD_KEYS = frozenset({
+    hrn.DEVICE_STATUS, hrn.STATE_1, hrn.STATE_2, hrn.STATE_3,
+    hrn.ALARM_1, hrn.ALARM_2, hrn.ALARM_3,
+    hrn.STARTUP_TIME, hrn.SHUTDOWN_TIME,
+})
+
+
+def _decorate_huawei_result(raw: dict[str, Any]) -> dict[str, Any]:
+    """Converts the two value types to_points() can't handle: datetimes
+    (startup/shutdown time) to ISO strings, and lists of flag names (state
+    and alarm bit fields) to one "|"-joined string."""
+    decorated: dict[str, Any] = {}
+    for key, value in raw.items():
+        if isinstance(value, datetime):
+            value = value.isoformat()
+        elif isinstance(value, list):
+            value = "|".join(str(v) for v in value)
+        if key in _HUAWEI_FORCE_FIELD_KEYS and isinstance(value, str):
+            value = ForceFieldStr(value)
+        decorated[key] = value
+    return decorated
+
+
+# --- Fetchers: each returns data ready for to_points(), or raises ---
+
+def _get_json(url: str, timeout: float = 5, **kwargs):
+    resp = requests.get(url, timeout=timeout, **kwargs)
     resp.raise_for_status()
     return resp.json()
+
+
+def fetch_nibe() -> dict:
+    # requests reads Basic auth from ~/.netrc. Self-signed cert -> verify=False.
+    points = _get_json(f"https://{NIBE_HOST}:8443/api/v1/devices/0/points", timeout=10, verify=False)
+    return {pid: _decorate_nibe_point(p) if isinstance(p, dict) else p for pid, p in points.items()}
 
 
 def fetch_homewizard() -> dict:
-    """Fetches the raw HomeWizard P1 data (no auth)."""
-    resp = requests.get(f"http://{HW_IP}/api/v1/data", timeout=5)
-    resp.raise_for_status()
-    return resp.json()
+    return _get_json(f"http://{HW_IP}/api/v1/data")
 
 
 def fetch_duco_info() -> dict:
-    """Fetches the raw system-wide Duco status (no auth)."""
-    resp = requests.get(f"http://{DUCO_IP}/v2/info", timeout=5)
-    resp.raise_for_status()
-    return resp.json()
+    return _get_json(f"http://{DUCO_IP}/v2/info")
 
 
 def fetch_duco_nodes() -> list:
-    """Fetches the raw per-node Duco sensor data (no auth).
-
-    Only unwraps the fixed envelope key 'Nodes', which is the endpoint's
-    top-level response shape (API contract), not a selection of fields.
-    """
-    resp = requests.get(f"http://{DUCO_IP}/v2/info/nodes", timeout=5)
-    resp.raise_for_status()
-    return resp.json().get("Nodes", [])
+    return _get_json(f"http://{DUCO_IP}/v2/info/nodes").get("Nodes", [])
 
 
 def fetch_host_health() -> dict:
-    """Fetches hardware health (lm-sensors, SMART, storage pools) from
-    health_endpoint.py, which runs on the bare Proxmox host, not in a
-    container."""
-    resp = requests.get(HEALTH_ENDPOINT_URL, timeout=10)
-    resp.raise_for_status()
-    return resp.json()
+    return _clean_host_health(_get_json(HEALTH_ENDPOINT_URL, timeout=10))
 
 
-def _huawei_pv_string_registers(pv_string_count: int) -> list[hrn.RegisterName]:
-    """Builds the PV string register list from the number of strings actually
-    installed (device.pv_string_count, read by the library), not hardcoded to
-    this unit's 2 strings, so the same code works on a SUN2000 model with more
-    or fewer strings. Builds the names itself (PV_01_VOLTAGE/CURRENT, ...)
-    instead of relying on the library's internal, undocumented
-    device._pv_registers attribute.
-    """
-    names: list[hrn.RegisterName] = []
-    for idx in range(1, pv_string_count + 1):
-        names.append(getattr(hrn, f"PV_{idx:02d}_VOLTAGE"))
-        names.append(getattr(hrn, f"PV_{idx:02d}_CURRENT"))
-    return names
-
-
-# Choosing WHICH registers to request is unavoidable here: huawei-solar has
-# no "give me everything" call like the JSON APIs of NIBE, HomeWizard and
-# Duco; batch_update() needs an explicit list of register names. This is the
-# Modbus equivalent of "which endpoint do we call", not a choice of which
-# fields of a response to throw away.
+# Modbus has no "give me everything" call: batch_update() needs an explicit
+# list of registers. PV string registers are added per installed string.
 HUAWEI_REGISTER_NAMES: list[hrn.RegisterName] = [
     hrn.MODEL_NAME, hrn.SERIAL_NUMBER, hrn.PN, hrn.FIRMWARE_VERSION, hrn.SOFTWARE_VERSION, hrn.MODEL_ID,
     hrn.NB_PV_STRINGS, hrn.NB_MPP_TRACKS, hrn.NB_OPTIMIZERS, hrn.RATED_POWER,
@@ -335,66 +264,19 @@ HUAWEI_REGISTER_NAMES: list[hrn.RegisterName] = [
     hrn.METER_STATUS, hrn.METER_TYPE, hrn.POWER_METER_ACTIVE_POWER, hrn.POWER_METER_REACTIVE_POWER,
 ]
 
-# These nine registers can change value (status and bit-field flags,
-# start/stop times), so _decorate_huawei_result() wraps them in ForceFieldStr
-# to avoid series fragmentation (see ForceFieldStr). startup_time and
-# shutdown_time only change once or twice a day, but "can change" is enough.
-# model_name/serial_number/pn/firmware_version/software_version stay plain
-# tags: they are stable device identity, with no risk of fragmentation.
-_HUAWEI_FORCE_FIELD_KEYS = frozenset({
-    hrn.DEVICE_STATUS, hrn.STATE_1, hrn.STATE_2, hrn.STATE_3,
-    hrn.ALARM_1, hrn.ALARM_2, hrn.ALARM_3,
-    hrn.STARTUP_TIME, hrn.SHUTDOWN_TIME,
-})
-
-
-def _decorate_huawei_result(raw: dict[str, Any]) -> dict[str, Any]:
-    """Converts huawei-solar's result values to types to_points() can handle.
-
-    Two cases the generic pipeline doesn't handle natively:
-    - datetime (startup_time/shutdown_time) -> ISO 8601 string, as a
-      ForceFieldStr (field, not tag).
-    - list of strings (state_1/2/3, alarm_1/2/3: Modbus bit fields already
-      translated to readable flag names by the library) -> joined into one
-      "|"-separated ForceFieldStr, or None for an empty list (no alarms or
-      flags: ignored, no empty string field).
-
-    All other values (int/float/bool/str/None/IntEnum) pass through
-    unchanged. An IntEnum (e.g. meter_status) is an int subtype and becomes a
-    numeric field automatically.
-    """
-    decorated: dict[str, Any] = {}
-    for key, value in raw.items():
-        if isinstance(value, datetime):
-            iso = value.isoformat()
-            decorated[key] = ForceFieldStr(iso) if key in _HUAWEI_FORCE_FIELD_KEYS else iso
-        elif isinstance(value, list):
-            joined = "|".join(str(v) for v in value)
-            if key in _HUAWEI_FORCE_FIELD_KEYS:
-                decorated[key] = ForceFieldStr(joined) if joined else None
-            else:
-                decorated[key] = joined or None
-        elif key in _HUAWEI_FORCE_FIELD_KEYS and isinstance(value, str):
-            decorated[key] = ForceFieldStr(value) if value != "" else None
-        else:
-            decorated[key] = value
-    return decorated
-
 
 async def _fetch_huawei_async() -> dict[str, Any]:
-    """One short-lived Modbus TCP connection: connect, read, disconnect.
-    Never keeps a connection open between cycles: the SDongleA accepts only
-    one Modbus TCP client at a time, so this minimises conflicts with, for
-    example, the FusionSolar app. disconnect() runs in a finally block so a
-    read that fails halfway doesn't leak the socket.
-    """
+    """Connects, reads and disconnects every cycle: the dongle accepts only
+    one Modbus client at a time, so holding the connection would lock out
+    the FusionSolar app."""
     client = huawei.create_tcp_client(HUAWEI_DONGLE_IP, unit_id=HUAWEI_UNIT_ID, timeout=HUAWEI_TIMEOUT)
     await client.connect()
     try:
         device = await huawei.create_device_instance(client)
-        register_names = list(HUAWEI_REGISTER_NAMES)
-        pv_string_count = getattr(device, "pv_string_count", 0) or 0
-        register_names.extend(_huawei_pv_string_registers(pv_string_count))
+        pv_strings = range(1, (getattr(device, "pv_string_count", 0) or 0) + 1)
+        register_names = HUAWEI_REGISTER_NAMES + [
+            getattr(hrn, f"PV_{i:02d}_{quantity}") for i in pv_strings for quantity in ("VOLTAGE", "CURRENT")
+        ]
         results = await device.batch_update(register_names)
         return {name: result.value for name, result in results.items()}
     finally:
@@ -402,193 +284,44 @@ async def _fetch_huawei_async() -> dict[str, Any]:
 
 
 def fetch_huawei() -> dict:
-    """Fetches the raw Huawei SUN2000 inverter data via the SDongleA (Modbus
-    TCP, unit ID HUAWEI_UNIT_ID).
-
-    No try/except of its own: like every other source, main()'s per-source
-    try/except catches any failure and skips this source for the cycle. There
-    is deliberately no distinction between "inverter in standby at night" and
-    "dongle unreachable"; both are just an exception.
-
-    The outer asyncio.wait_for() is a hard deadline: the library can retry a
-    connection internally for up to 60 s, which would otherwise eat most of
-    a COLLECTOR_INTERVAL cycle and stall the collector on a flaky dongle.
-    """
+    # Hard deadline: the library retries a connection internally for up to
+    # 60 s, which would stall the whole cycle on a flaky dongle. At night the
+    # inverter is in standby and this raises, like any other failed source.
     raw = asyncio.run(asyncio.wait_for(_fetch_huawei_async(), timeout=HUAWEI_TIMEOUT + 5))
     return _decorate_huawei_result(raw)
 
 
-def fetch_outdoor_weather() -> dict:
-    """Fetches current outdoor temperature and humidity from Open-Meteo (free,
-    no API key). Goes over the public internet instead of the local network,
-    hence the explicit timeout and a separate, much lower poll rate (see
-    OUTDOOR_WEATHER_INTERVAL and main()).
-    """
-    resp = requests.get(
+# --- Weather: each fetcher returns a reading with its observation time ---
+
+def parse_open_meteo(data: dict) -> dict | None:
+    """Turns an Open-Meteo response into a reading stamped with current.time,
+    the start of its 15-minute model interval."""
+    current = data.get("current") or {}
+    observed = current.get("time")
+    reading = {"temp_c": current.get("temperature_2m"), "humidity_pct": current.get("relative_humidity_2m")}
+    if not isinstance(observed, (int, float)) or all(v is None for v in reading.values()):
+        log.error(f"Open-Meteo: no usable reading in response: {current!r}")
+        return None
+    return {"observed_at": datetime.fromtimestamp(observed, timezone.utc), **reading}
+
+
+def fetch_outdoor_weather() -> dict | None:
+    data = _get_json(
         "https://api.open-meteo.com/v1/forecast",
+        timeout=10,
         params={
             "latitude": OPEN_METEO_LAT,
             "longitude": OPEN_METEO_LON,
             "current": "temperature_2m,relative_humidity_2m",
-            # current.time as a UTC epoch instead of a zone-less ISO string.
-            "timeformat": "unixtime",
+            "timeformat": "unixtime",  # UTC epoch instead of a zone-less ISO string
         },
-        timeout=10,
     )
-    resp.raise_for_status()
-    return resp.json()
-
-
-def build_outdoor_point(outdoor_raw: dict) -> Point | None:
-    """Turns the Open-Meteo response into one 'outdoor_weather' Point with
-    raw measurements (temp_c, humidity_pct). No derived vapour pressure here;
-    that is calculated at query time in Flux (Magnus formula).
-
-    Hand-curated instead of going through to_points(): the schema is small
-    and fixed (two values), and 'temp_c'/'humidity_pct' are deliberately
-    chosen field names.
-
-    Stamped with Open-Meteo's own `current.time` (the start of its 15-minute
-    model interval), not the cycle timestamp. The cached response is written
-    again every cycle, but always with that same time, so InfluxDB overwrites
-    the same point instead of recording a stale value as a new reading.
-    Without a time the point is skipped: there is nothing honest to stamp it
-    with.
-    """
-    current = outdoor_raw.get("current") or {}
-    temp_c = current.get("temperature_2m")
-    humidity_pct = current.get("relative_humidity_2m")
-    observed_epoch = current.get("time")
-    if temp_c is None and humidity_pct is None:
-        return None
-    if not isinstance(observed_epoch, (int, float)):
-        log.error(f"Open-Meteo: current.time missing or not an epoch ({observed_epoch!r}), point skipped.")
-        return None
-
-    point = Point("outdoor_weather").time(datetime.fromtimestamp(observed_epoch, timezone.utc))
-    if temp_c is not None:
-        point = point.field("temp_c", float(temp_c))
-    if humidity_pct is not None:
-        point = point.field("humidity_pct", float(humidity_pct))
-    return point
-
-
-def fetch_meteobelgie_station() -> dict | None:
-    """Scrapes the "Overzicht" (overview) block of the MeteoBelgie weather
-    station page for Sint-Niklaas (Davis Vantage Pro II). Not an API, an
-    ordinary web page.
-
-    DOM parsing with BeautifulSoup, deliberately not a regex over the raw
-    HTML: only the loose text nodes without schema.org markup (Dauwpunt =
-    dew point, Status) are parsed with a small regex on that single node.
-
-    Returns None (with a clear ERROR log, never silently) as soon as the
-    expected structure no longer matches. That has to read as "the scraper
-    broke because the site changed", not be confused with an ordinary
-    temporary network error (already handled and logged by the try/except in
-    main()).
-
-    Also returns None (with a WARNING) when the station doesn't report
-    "Online": its values are then probably stale and are not written.
-    """
-    resp = requests.get(METEOBELGIE_URL, headers={"User-Agent": METEOBELGIE_USER_AGENT}, timeout=10)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    section = soup.find("section", class_="weather-station")
-    if section is None:
-        log.error(
-            "MeteoBelgie: <section class='weather-station'> not found on the page -- "
-            "the site structure has probably changed (redesign?). The parser in "
-            "fetch_meteobelgie_station() needs updating. Cycle skipped."
-        )
-        return None
-
-    def _itemprop_float(name: str) -> float | None:
-        node = section.find(attrs={"itemprop": name})
-        if node is None:
-            return None
-        try:
-            # split(":", 1): split on the FIRST colon only. The value itself
-            # has none, but windSpeed's text does (a time like "13:51"), so
-            # split(":")[-1] would break there.
-            return float(node.get_text(" ", strip=True).split(":", 1)[-1].strip())
-        except (ValueError, IndexError):
-            return None
-
-    def _labeled_float(label: str) -> float | None:
-        """For values without an itemprop (e.g. Dauwpunt): finds the text
-        node containing the label and parses the first number after it."""
-        text_node = section.find(string=re.compile(re.escape(label)))
-        if text_node is None:
-            return None
-        match = re.search(rf"{re.escape(label)}\s*:\s*(-?\d+(?:\.\d+)?)", text_node)
-        return float(match.group(1)) if match else None
-
-    temp_c = _itemprop_float("temperature")
-    humidity_pct = _itemprop_float("humidity")
-    pressure_hpa = _itemprop_float("airPressure")
-    dewpoint_c = _labeled_float("Dauwpunt")
-    observed_at = parse_meteobelgie_observed_at(section.get_text(" ", strip=True))
-
-    status_node = section.find(string=re.compile(r"Status\s*:"))
-    status_match = re.search(r"Status\s*:\s*(\S+)", status_node) if status_node else None
-    status = status_match.group(1).strip() if status_match else None
-
-    wind_direction = None
-    wind_node = section.find(attrs={"itemprop": "windDirection"})
-    if wind_node is not None:
-        wind_direction = wind_node.get_text(" ", strip=True).split(":", 1)[-1].strip()
-
-    wind_speed_raw = None
-    wind_speed_node = section.find(attrs={"itemprop": "windSpeed"})
-    if wind_speed_node is not None:
-        # split(":", 1): the value contains a time ("13:51"), so split only
-        # on the first colon (the label/value separator).
-        wind_speed_raw = wind_speed_node.get_text(" ", strip=True).split(":", 1)[-1].strip()
-
-    missing = [
-        name for name, val in (
-            ("temperature", temp_c), ("humidity", humidity_pct),
-            ("pressure", pressure_hpa), ("dew point", dewpoint_c), ("status", status),
-            ("observation time", observed_at),
-        )
-        if val is None
-    ]
-    if missing:
-        log.error(
-            f"MeteoBelgie: could not find or parse these fields in the overview block: {missing} -- "
-            "the site structure has probably changed. The parser needs updating. "
-            "Cycle skipped."
-        )
-        return None
-
-    if status != "Online":
-        log.warning(
-            f"MeteoBelgie station reports status '{status}' (not 'Online') -- values are treated as "
-            "stale and not written this cycle."
-        )
-        return None
-
-    return {
-        "temp_c": temp_c,
-        "humidity_pct": humidity_pct,
-        "pressure_hpa": pressure_hpa,
-        "dewpoint_c": dewpoint_c,
-        "wind_direction": wind_direction,
-        "wind_speed_raw": wind_speed_raw,
-        "observed_at": observed_at,
-    }
+    return parse_open_meteo(data)
 
 
 def parse_meteobelgie_observed_at(text: str) -> datetime | None:
-    """Parses the station's observation time from the overview header
-    ("Overzicht van 09-11-2026 om 20:11", Belgian local time) into UTC.
-
-    In the one ambiguous hour when summer time ends, zoneinfo picks the
-    first occurrence (fold=0). That can put one reading a year an hour off,
-    which is acceptable for hourly weather.
-    """
+    """Parses "Overzicht van 09-11-2026 om 20:11" (Belgian local time) to UTC.
+    In the repeated hour when summer time ends, zoneinfo picks the first one."""
     match = re.search(r"Overzicht van (\d{2})-(\d{2})-(\d{4}) om (\d{2}):(\d{2})", text)
     if match is None:
         return None
@@ -600,208 +333,148 @@ def parse_meteobelgie_observed_at(text: str) -> datetime | None:
     return local.astimezone(timezone.utc)
 
 
-def build_meteobelgie_point(station_raw: dict) -> Point:
-    """Turns the MeteoBelgie scrape into one 'meteobelgie_sint_niklaas'
-    Point. Hand-curated like Open-Meteo (not through to_points()): a small,
-    fixed set of fields. Wind direction and speed are not written yet: their
-    raw string form isn't unambiguous enough to model as typed fields.
+def parse_meteobelgie(html: str) -> dict | None:
+    """Reads the overview block of the station page.
 
-    Stamped with the station's own observation time, for the same reason as
-    build_outdoor_point(): rewriting the cached reading every cycle then
-    overwrites one point instead of making an hour-old value look fresh.
+    Returns None with an ERROR when the expected structure is missing, so a
+    site redesign reads as "the scraper broke", not as a network error. Also
+    returns None when the station isn't online: its values are then stale.
     """
-    return (
-        Point("meteobelgie_sint_niklaas")
-        .field("temp_c", float(station_raw["temp_c"]))
-        .field("humidity_pct", float(station_raw["humidity_pct"]))
-        .field("pressure_hpa", float(station_raw["pressure_hpa"]))
-        .field("dewpoint_c", float(station_raw["dewpoint_c"]))
-        .time(station_raw["observed_at"])
-    )
+    section = BeautifulSoup(html, "html.parser").find("section", class_="weather-station")
+    if section is None:
+        log.error("MeteoBelgie: <section class='weather-station'> not found, the page has changed.")
+        return None
+    text = section.get_text(" ", strip=True)
 
+    def number_after(label: str) -> float | None:
+        match = re.search(rf"{label}\s*:\s*(-?\d+(?:\.\d+)?)", text)
+        return float(match.group(1)) if match else None
 
-def build_points(
-    nibe_raw: dict,
-    hw_raw: dict,
-    duco_info_raw: dict,
-    duco_nodes_raw: list,
-    host_health_raw: dict,
-    huawei_raw: dict,
-    outdoor_raw: dict | None,
-    meteobelgie_raw: dict | None,
-    ts: datetime,
-) -> list[Point]:
-    """Converts the raw sources into InfluxDB Points through the generic
-    flatten pipeline (to_points), plus the two separately handled weather
-    Points (outdoor_weather, meteobelgie_sint_niklaas).
-    """
-    decorated_nibe = {
-        point_id: _decorate_nibe_point(raw) if isinstance(raw, dict) else raw
-        for point_id, raw in nibe_raw.items()
+    status = re.search(r"Status\s*:\s*(\S+)", text)
+    reading = {
+        "observed_at": parse_meteobelgie_observed_at(text),
+        "temp_c": number_after("Temperatuur"),
+        "humidity_pct": number_after("Vochtigheid"),
+        "pressure_hpa": number_after("Druk"),
+        "dewpoint_c": number_after("Dauwpunt"),
     }
+    missing = [name for name, value in reading.items() if value is None] + ([] if status else ["status"])
+    if missing:
+        log.error(f"MeteoBelgie: could not parse {missing}, the page has probably changed.")
+        return None
+    if status.group(1) != "Online":
+        log.warning(f"MeteoBelgie station reports '{status.group(1)}', not 'Online'; values not written.")
+        return None
+    return reading
 
+
+def fetch_meteobelgie_station() -> dict | None:
+    resp = requests.get(METEOBELGIE_URL, headers={"User-Agent": METEOBELGIE_USER_AGENT}, timeout=10)
+    resp.raise_for_status()
+    return parse_meteobelgie(resp.text)
+
+
+def weather_point(measurement: str, reading: dict) -> Point:
+    """One Point per reading, stamped with its observation time. The cached
+    reading is written again every cycle; with the same timestamp, each
+    rewrite overwrites the same point."""
+    point = Point(measurement).time(reading["observed_at"])
+    for name, value in reading.items():
+        if name != "observed_at" and value is not None:
+            point = point.field(name, float(value))
+    return point
+
+
+# --- Cycle ---
+
+# Polled every cycle. The key is the measurement name.
+LOCAL_SOURCES: dict[str, Callable[[], Any]] = {
+    "nibe": fetch_nibe,
+    "homewizard": fetch_homewizard,
+    "duco_info": fetch_duco_info,
+    "duco_nodes": fetch_duco_nodes,
+    "host_health": fetch_host_health,
+    "huawei": fetch_huawei,
+}
+
+
+def fetch_or_empty(name: str, fetch: Callable[[], Any]) -> Any:
+    """One failing source never stops the others: its error is logged and
+    the source contributes nothing this cycle."""
+    try:
+        return fetch()
+    except Exception as e:
+        log.error(f"{name} fetch failed: {e}")
+        return {}
+
+
+class SlowSource:
+    """A source fetched at most once per `interval` seconds, keeping its last
+    good reading in between and after a failed attempt. Every attempt counts,
+    so a failing source is retried after the interval, not every cycle."""
+
+    def __init__(self, fetch: Callable[[], dict | None], interval: float):
+        self.fetch = fetch
+        self.interval = interval
+        self.reading: dict | None = None
+        self.last_attempt: float | None = None
+
+    def get(self, name: str, now: float) -> dict | None:
+        if self.last_attempt is None or now - self.last_attempt >= self.interval:
+            self.last_attempt = now
+            self.reading = fetch_or_empty(name, self.fetch) or self.reading
+        return self.reading
+
+
+def build_points(local: dict[str, Any], weather: dict[str, dict | None], ts: datetime) -> list[Point]:
+    """Device data through the generic pipeline on the cycle timestamp,
+    weather readings on their own observation time."""
     points: list[Point] = []
-    points += to_points("nibe", decorated_nibe, ts)
-    points += to_points("homewizard", hw_raw, ts)
-    points += to_points("duco_info", duco_info_raw, ts)
-    points += to_points("duco_nodes", duco_nodes_raw, ts)
-    # health_endpoint.py's envelope is split into its sections before
-    # flattening, not passed as a whole; otherwise to_points() would produce
-    # measurement names like "host_health_sensors" instead of "sensors",
-    # "smart_nvme" and "smart_nvme1". to_points() safely returns [] for
-    # None/{} (e.g. after a failed fetch). health_endpoint.py can also fail a
-    # single drive without failing the whole request, returning {"error": ...}
-    # under that drive's key. That error must not be flattened as if it were
-    # smartctl data, so it is skipped here: like the other sources, a failed
-    # source is skipped, never written as error data.
-    points += to_points("sensors", host_health_raw.get("sensors"), ts)
-    for smart_key in ("smart_nvme", "smart_nvme1"):
-        smart_data = host_health_raw.get(smart_key)
-        if isinstance(smart_data, dict) and "error" in smart_data:
-            continue
-        points += to_points(smart_key, _strip_smartctl_asctime(smart_data), ts)
-
-    # storage_pools is a list of pool dicts (pvesm status has no JSON output,
-    # so health_endpoint.py parses it). to_points() splits the list into one
-    # Point per pool (tag index=<position>), and because every pool dict
-    # contains a "name" string, the same Point is also tagged name=<pool>,
-    # without any change to to_points(). Same skip-on-error guard as the
-    # SMART sources above.
-    storage_pools = host_health_raw.get("storage_pools")
-    if not (isinstance(storage_pools, dict) and "error" in storage_pools):
-        points += to_points("storage_pools", storage_pools, ts)
-
-    # huawei_raw has already been through _decorate_huawei_result() (in
-    # fetch_huawei()), so only the generic flatten is needed here.
-    # to_points() safely returns [] for an empty dict (failed fetch, e.g. an
-    # unreachable dongle).
-    points += to_points("huawei", huawei_raw, ts)
-
-    if outdoor_raw is not None:
-        outdoor_point = build_outdoor_point(outdoor_raw)
-        if outdoor_point is not None:
-            points.append(outdoor_point)
-
-    if meteobelgie_raw is not None:
-        points.append(build_meteobelgie_point(meteobelgie_raw))
-
+    for name, data in local.items():
+        if name == "host_health":
+            # Each section becomes its own measurement ("sensors",
+            # "smart_nvme"), not "host_health_sensors".
+            for section, section_data in data.items():
+                points += to_points(section, section_data, ts)
+        else:
+            points += to_points(name, data, ts)
+    points += [weather_point(name, reading) for name, reading in weather.items() if reading]
     return points
 
 
-def refresh_cached(
-    cache: dict | None,
-    last_attempt: float | None,
-    interval: float,
-    now: float,
-    fetch,
-    name: str,
-) -> tuple[dict | None, float | None]:
-    """Refreshes a slowly polled source at most once per `interval` seconds.
-
-    Returns the (possibly unchanged) cache and the time of the last attempt.
-    Every attempt counts, successful or not: a failing or unusable source is
-    retried after `interval`, not on every cycle. A fetch that raises, or that
-    returns None (e.g. a weather station reporting it isn't online), keeps the
-    previous cached value instead of clearing it.
-    """
-    if last_attempt is not None and now - last_attempt < interval:
-        return cache, last_attempt
-    try:
-        fresh = fetch()
-    except Exception as e:
-        log.error(f"{name} fetch failed: {e}")
-        return cache, now
-    return (fresh if fresh is not None else cache), now
+def next_cycle_delay(scheduled: float, interval: float, now: float) -> tuple[float, float]:
+    """Returns the next cycle's start and how long to sleep until then.
+    Cycles start `interval` apart, however long the fetches took. A cycle
+    that overran starts the next one now, without catching up."""
+    upcoming = scheduled + interval
+    if upcoming <= now:
+        return now, 0.0
+    return upcoming, upcoming - now
 
 
 def main():
     client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
     write_api = client.write_api(write_options=SYNCHRONOUS)
-
     log.info(f"Collector started, interval={INTERVAL}s, bucket={INFLUX_BUCKET}")
 
-    outdoor_cache: dict | None = None
-    last_outdoor_attempt: float | None = None
-    meteobelgie_cache: dict | None = None
-    last_meteobelgie_attempt: float | None = None
-
-    # Cycles are scheduled on the monotonic clock: each one starts INTERVAL
-    # after the previous one started, however long the fetches took. A plain
-    # sleep(INTERVAL) after the work stretched every cycle by the fetch time
-    # (about 67 s instead of 60 s on average).
+    # Keyed by measurement name, like LOCAL_SOURCES.
+    weather_sources = {
+        "outdoor_weather": SlowSource(fetch_outdoor_weather, OUTDOOR_WEATHER_INTERVAL),
+        "meteobelgie_sint_niklaas": SlowSource(fetch_meteobelgie_station, METEOBELGIE_INTERVAL),
+    }
     next_cycle = time.monotonic()
 
     while True:
         ts = datetime.now(timezone.utc)
+        local = {name: fetch_or_empty(name, fetch) for name, fetch in LOCAL_SOURCES.items()}
+        now = time.monotonic()
+        weather = {name: source.get(name, now) for name, source in weather_sources.items()}
 
-        try:
-            nibe_raw = fetch_nibe()
-        except Exception as e:
-            log.error(f"NIBE fetch failed: {e}")
-            nibe_raw = {}
-
-        try:
-            hw_raw = fetch_homewizard()
-        except Exception as e:
-            log.error(f"HomeWizard fetch failed: {e}")
-            hw_raw = {}
-
-        try:
-            duco_info_raw = fetch_duco_info()
-        except Exception as e:
-            log.error(f"Duco info fetch failed: {e}")
-            duco_info_raw = {}
-
-        try:
-            duco_nodes_raw = fetch_duco_nodes()
-        except Exception as e:
-            log.error(f"Duco nodes fetch failed: {e}")
-            duco_nodes_raw = []
-
-        try:
-            host_health_raw = fetch_host_health()
-        except Exception as e:
-            log.error(f"Host health fetch failed: {e}")
-            host_health_raw = {}
-
-        try:
-            huawei_raw = fetch_huawei()
-        except Exception as e:
-            # No distinction between "inverter in standby at night" and
-            # "dongle really unreachable": both are just an exception here,
-            # like the other sources. An empty dict makes
-            # to_points("huawei", {}, ts) in build_points() return [] for
-            # this cycle without crashing the collector.
-            log.error(f"Huawei fetch failed: {e}")
-            huawei_raw = {}
-
-        # The weather sources have their own, much lower poll rates than
-        # COLLECTOR_INTERVAL: weather changes slowly, Open-Meteo is a free
-        # public API, and MeteoBelgie is a real website not meant for
-        # machines (default once an hour). In between, the last known value
-        # is written again under its own observation time, which overwrites
-        # the same point (see build_outdoor_point()).
-        now_monotonic = time.monotonic()
-        outdoor_cache, last_outdoor_attempt = refresh_cached(
-            outdoor_cache, last_outdoor_attempt, OUTDOOR_WEATHER_INTERVAL,
-            now_monotonic, fetch_outdoor_weather, "Outdoor weather",
-        )
-        meteobelgie_cache, last_meteobelgie_attempt = refresh_cached(
-            meteobelgie_cache, last_meteobelgie_attempt, METEOBELGIE_INTERVAL,
-            now_monotonic, fetch_meteobelgie_station, "MeteoBelgie",
-        )
-
-        if (
-            not nibe_raw and not hw_raw and not duco_info_raw and not duco_nodes_raw
-            and not host_health_raw and not huawei_raw and not outdoor_cache and not meteobelgie_cache
-        ):
+        if not any(local.values()) and not any(weather.values()):
             log.warning("All sources failed this cycle, skipping write")
         else:
             try:
-                points = build_points(
-                    nibe_raw, hw_raw, duco_info_raw, duco_nodes_raw, host_health_raw, huawei_raw,
-                    outdoor_cache, meteobelgie_cache, ts,
-                )
+                points = build_points(local, weather, ts)
                 write_api.write(bucket=INFLUX_BUCKET, record=points)
                 log.info(f"{len(points)} points written ({ts.isoformat()})")
             except Exception as e:
@@ -810,17 +483,6 @@ def main():
         next_cycle, delay = next_cycle_delay(next_cycle, INTERVAL, time.monotonic())
         if delay > 0:
             time.sleep(delay)
-
-
-def next_cycle_delay(scheduled: float, interval: float, now: float) -> tuple[float, float]:
-    """Returns the start time of the next cycle and how long to sleep until
-    then. A cycle that overran its slot (a slow source near the timeout)
-    starts the next one immediately and reschedules from now, instead of
-    firing a burst of back-to-back cycles to catch up."""
-    upcoming = scheduled + interval
-    if upcoming <= now:
-        return now, 0.0
-    return upcoming, upcoming - now
 
 
 if __name__ == "__main__":
