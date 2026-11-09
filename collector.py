@@ -3,8 +3,9 @@
 Polls a NIBE heat pump, a HomeWizard P1 meter, a Duco ventilation unit, a
 Huawei SUN2000 inverter and a host-health endpoint on a fixed interval, plus
 Open-Meteo and a MeteoBelgie weather-station page on their own, much longer
-intervals. Everything is written to InfluxDB with one shared timestamp per
-cycle, so the sources line up exactly for later analysis.
+intervals. The local devices share one timestamp per cycle, so they line up
+exactly for later analysis. The weather sources carry their own observation
+time instead: a cached reading is never restamped as if it were new.
 
 Usage:
     uv run collector.py
@@ -19,6 +20,7 @@ import time
 import logging
 from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
@@ -74,6 +76,8 @@ OUTDOOR_WEATHER_INTERVAL = int(os.environ.get("OUTDOOR_WEATHER_INTERVAL", "900")
 METEOBELGIE_URL = "https://www.meteobelgie.be/waarnemingen/belgie/weerstation/262/sint-niklaas-provincie-oost-vlaanderen-21m"
 METEOBELGIE_USER_AGENT = "OstdonkIntelligence/1.0 (personal project, non-commercial)"
 METEOBELGIE_INTERVAL = int(os.environ.get("METEOBELGIE_INTERVAL", "3600"))  # 1 hour
+# The station page shows its observation time in Belgian local time.
+METEOBELGIE_TZ = ZoneInfo("Europe/Brussels")
 
 
 # --- Generic flatten pipeline ---
@@ -426,6 +430,8 @@ def fetch_outdoor_weather() -> dict:
             "latitude": OPEN_METEO_LAT,
             "longitude": OPEN_METEO_LON,
             "current": "temperature_2m,relative_humidity_2m",
+            # current.time as a UTC epoch instead of a zone-less ISO string.
+            "timeformat": "unixtime",
         },
         timeout=10,
     )
@@ -433,7 +439,7 @@ def fetch_outdoor_weather() -> dict:
     return resp.json()
 
 
-def build_outdoor_point(outdoor_raw: dict, ts: datetime) -> Point | None:
+def build_outdoor_point(outdoor_raw: dict) -> Point | None:
     """Turns the Open-Meteo response into one 'outdoor_weather' Point with
     raw measurements (temp_c, humidity_pct). No derived vapour pressure here;
     that is calculated at query time in Flux (Magnus formula).
@@ -441,14 +447,25 @@ def build_outdoor_point(outdoor_raw: dict, ts: datetime) -> Point | None:
     Hand-curated instead of going through to_points(): the schema is small
     and fixed (two values), and 'temp_c'/'humidity_pct' are deliberately
     chosen field names.
+
+    Stamped with Open-Meteo's own `current.time` (the start of its 15-minute
+    model interval), not the cycle timestamp. The cached response is written
+    again every cycle, but always with that same time, so InfluxDB overwrites
+    the same point instead of recording a stale value as a new reading.
+    Without a time the point is skipped: there is nothing honest to stamp it
+    with.
     """
     current = outdoor_raw.get("current") or {}
     temp_c = current.get("temperature_2m")
     humidity_pct = current.get("relative_humidity_2m")
+    observed_epoch = current.get("time")
     if temp_c is None and humidity_pct is None:
         return None
+    if not isinstance(observed_epoch, (int, float)):
+        log.error(f"Open-Meteo: current.time missing or not an epoch ({observed_epoch!r}), point skipped.")
+        return None
 
-    point = Point("outdoor_weather").time(ts)
+    point = Point("outdoor_weather").time(datetime.fromtimestamp(observed_epoch, timezone.utc))
     if temp_c is not None:
         point = point.field("temp_c", float(temp_c))
     if humidity_pct is not None:
@@ -512,6 +529,7 @@ def fetch_meteobelgie_station() -> dict | None:
     humidity_pct = _itemprop_float("humidity")
     pressure_hpa = _itemprop_float("airPressure")
     dewpoint_c = _labeled_float("Dauwpunt")
+    observed_at = parse_meteobelgie_observed_at(section.get_text(" ", strip=True))
 
     status_node = section.find(string=re.compile(r"Status\s*:"))
     status_match = re.search(r"Status\s*:\s*(\S+)", status_node) if status_node else None
@@ -533,6 +551,7 @@ def fetch_meteobelgie_station() -> dict | None:
         name for name, val in (
             ("temperature", temp_c), ("humidity", humidity_pct),
             ("pressure", pressure_hpa), ("dew point", dewpoint_c), ("status", status),
+            ("observation time", observed_at),
         )
         if val is None
     ]
@@ -558,14 +577,38 @@ def fetch_meteobelgie_station() -> dict | None:
         "dewpoint_c": dewpoint_c,
         "wind_direction": wind_direction,
         "wind_speed_raw": wind_speed_raw,
+        "observed_at": observed_at,
     }
 
 
-def build_meteobelgie_point(station_raw: dict, ts: datetime) -> Point:
+def parse_meteobelgie_observed_at(text: str) -> datetime | None:
+    """Parses the station's observation time from the overview header
+    ("Overzicht van 09-11-2026 om 20:11", Belgian local time) into UTC.
+
+    In the one ambiguous hour when summer time ends, zoneinfo picks the
+    first occurrence (fold=0). That can put one reading a year an hour off,
+    which is acceptable for hourly weather.
+    """
+    match = re.search(r"Overzicht van (\d{2})-(\d{2})-(\d{4}) om (\d{2}):(\d{2})", text)
+    if match is None:
+        return None
+    day, month, year, hour, minute = (int(g) for g in match.groups())
+    try:
+        local = datetime(year, month, day, hour, minute, tzinfo=METEOBELGIE_TZ)
+    except ValueError:
+        return None
+    return local.astimezone(timezone.utc)
+
+
+def build_meteobelgie_point(station_raw: dict) -> Point:
     """Turns the MeteoBelgie scrape into one 'meteobelgie_sint_niklaas'
     Point. Hand-curated like Open-Meteo (not through to_points()): a small,
     fixed set of fields. Wind direction and speed are not written yet: their
     raw string form isn't unambiguous enough to model as typed fields.
+
+    Stamped with the station's own observation time, for the same reason as
+    build_outdoor_point(): rewriting the cached reading every cycle then
+    overwrites one point instead of making an hour-old value look fresh.
     """
     return (
         Point("meteobelgie_sint_niklaas")
@@ -573,7 +616,7 @@ def build_meteobelgie_point(station_raw: dict, ts: datetime) -> Point:
         .field("humidity_pct", float(station_raw["humidity_pct"]))
         .field("pressure_hpa", float(station_raw["pressure_hpa"]))
         .field("dewpoint_c", float(station_raw["dewpoint_c"]))
-        .time(ts)
+        .time(station_raw["observed_at"])
     )
 
 
@@ -635,12 +678,12 @@ def build_points(
     points += to_points("huawei", huawei_raw, ts)
 
     if outdoor_raw is not None:
-        outdoor_point = build_outdoor_point(outdoor_raw, ts)
+        outdoor_point = build_outdoor_point(outdoor_raw)
         if outdoor_point is not None:
             points.append(outdoor_point)
 
     if meteobelgie_raw is not None:
-        points.append(build_meteobelgie_point(meteobelgie_raw, ts))
+        points.append(build_meteobelgie_point(meteobelgie_raw))
 
     return points
 
@@ -681,6 +724,12 @@ def main():
     last_outdoor_attempt: float | None = None
     meteobelgie_cache: dict | None = None
     last_meteobelgie_attempt: float | None = None
+
+    # Cycles are scheduled on the monotonic clock: each one starts INTERVAL
+    # after the previous one started, however long the fetches took. A plain
+    # sleep(INTERVAL) after the work stretched every cycle by the fetch time
+    # (about 67 s instead of 60 s on average).
+    next_cycle = time.monotonic()
 
     while True:
         ts = datetime.now(timezone.utc)
@@ -730,7 +779,8 @@ def main():
         # COLLECTOR_INTERVAL: weather changes slowly, Open-Meteo is a free
         # public API, and MeteoBelgie is a real website not meant for
         # machines (default once an hour). In between, the last known value
-        # is reused, so every write cycle still gets a weather point.
+        # is written again under its own observation time, which overwrites
+        # the same point (see build_outdoor_point()).
         now_monotonic = time.monotonic()
         outdoor_cache, last_outdoor_attempt = refresh_cached(
             outdoor_cache, last_outdoor_attempt, OUTDOOR_WEATHER_INTERVAL,
@@ -757,7 +807,20 @@ def main():
             except Exception as e:
                 log.error(f"Processing/writing failed: {e}")
 
-        time.sleep(INTERVAL)
+        next_cycle, delay = next_cycle_delay(next_cycle, INTERVAL, time.monotonic())
+        if delay > 0:
+            time.sleep(delay)
+
+
+def next_cycle_delay(scheduled: float, interval: float, now: float) -> tuple[float, float]:
+    """Returns the start time of the next cycle and how long to sleep until
+    then. A cycle that overran its slot (a slow source near the timeout)
+    starts the next one immediately and reschedules from now, instead of
+    firing a burst of back-to-back cycles to catch up."""
+    upcoming = scheduled + interval
+    if upcoming <= now:
+        return now, 0.0
+    return upcoming, upcoming - now
 
 
 if __name__ == "__main__":

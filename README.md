@@ -1,6 +1,6 @@
 # Home energy data collector
 
-A Python daemon that polls a heat pump, a solar inverter, a grid meter, a ventilation unit, the host it runs on and two weather sources, and writes everything to InfluxDB with **one shared timestamp per cycle**, so the sources line up exactly for cross-device analysis.
+A Python daemon that polls a heat pump, a solar inverter, a grid meter, a ventilation unit, the host it runs on and two weather sources, and writes everything to InfluxDB. The local devices share **one timestamp per cycle**, so they line up exactly for cross-device analysis. The weather sources keep their own observation time.
 
 The write-up, including what the data turned up: [One clock, seven sources, and a fan fighting physics](https://gert-willem.netlify.app/blog/home-energy-collector/).
 
@@ -37,11 +37,11 @@ flowchart TB
 
 Each cycle, `collector.py`:
 
-1. Takes one UTC timestamp, used for every point written in that cycle.
+1. Takes one UTC timestamp, used for every device point written in that cycle.
 2. Fetches every local source, each in its own `try/except`: one dead source never blocks the others, and errors are never written as data.
-3. Reuses the cached weather responses unless their own, longer interval has elapsed.
+3. Reuses the cached weather responses unless their own, longer interval has elapsed. Weather points carry the source's observation time (Open-Meteo's `current.time`, the station page's "Overzicht van ..." header), not the cycle timestamp. Writing a cached reading again overwrites the same point instead of making it look fresh; align weather with device data at query time, for example with `fill(usePrevious: true)`.
 4. Flattens every response into InfluxDB points with one generic function, `to_points()`, that knows no field names. Numeric-keyed dicts and lists become one point per entity, nested dicts become path-joined field names, strings become tags and numbers become float fields. A few explicit, documented exceptions handle protocol quirks (NIBE's sentinel value and divisor, Huawei's datetime and flag types, smartctl's per-run timestamp string). The two weather sources are built by hand with chosen field names.
-5. Writes all points in one synchronous call, then sleeps `COLLECTOR_INTERVAL`.
+5. Writes all points in one synchronous call, then sleeps until the next cycle. Cycles start `COLLECTOR_INTERVAL` apart on the monotonic clock, so fetch time doesn't stretch the interval.
 
 [`downsample.flux`](downsample.flux) is the InfluxDB task that rolls the raw data up into 15-minute means for the long term. It works on an allowlist of numeric fields, because Flux's `mean()` fails on strings and booleans.
 

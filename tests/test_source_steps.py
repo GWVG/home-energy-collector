@@ -10,12 +10,33 @@ from collector import (
     _decorate_huawei_result,
     _decorate_nibe_point,
     _strip_smartctl_asctime,
+    build_meteobelgie_point,
     build_outdoor_point,
     build_points,
+    parse_meteobelgie_observed_at,
 )
 from helpers import parse, parse_all
 
 TS = datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc)
+# Weather observations are older than the cycle that writes them.
+OPEN_METEO_TIME = datetime(2026, 8, 4, 11, 45, tzinfo=timezone.utc)
+STATION_TIME = datetime(2026, 8, 4, 11, 10, tzinfo=timezone.utc)
+
+
+def open_meteo(temp=31.8, rh=50, time=OPEN_METEO_TIME.timestamp()):
+    return {"current": {"time": time, "temperature_2m": temp, "relative_humidity_2m": rh}}
+
+
+def station(**overrides):
+    raw = {"temp_c": 20.4, "humidity_pct": 84.9, "pressure_hpa": 1012, "dewpoint_c": 17.8,
+           "observed_at": STATION_TIME}
+    raw.update(overrides)
+    return raw
+
+
+def stamp(point):
+    """The point's timestamp, as a UTC datetime."""
+    return datetime.fromtimestamp(int(point.to_line_protocol().rsplit(" ", 1)[1]) / 1e9, timezone.utc)
 
 
 def nibe_point(integer_value, divisor=10, is_ok=True):
@@ -86,12 +107,41 @@ def test_huawei_datetime_and_flag_lists_become_field_strings():
 # --- Open-Meteo: hand-curated point ---
 
 def test_outdoor_point_uses_chosen_field_names():
-    point = build_outdoor_point({"current": {"temperature_2m": 31.8, "relative_humidity_2m": 50}}, TS)
+    point = build_outdoor_point(open_meteo())
     assert parse(point) == ("outdoor_weather", {}, {"temp_c": 31.8, "humidity_pct": 50.0})
 
 
+def test_outdoor_point_carries_open_meteo_time_not_cycle_time():
+    assert stamp(build_outdoor_point(open_meteo())) == OPEN_METEO_TIME
+
+
 def test_outdoor_point_skipped_when_response_has_no_values():
-    assert build_outdoor_point({"current": {}}, TS) is None
+    assert build_outdoor_point({"current": {"time": OPEN_METEO_TIME.timestamp()}}) is None
+
+
+def test_outdoor_point_skipped_without_observation_time():
+    assert build_outdoor_point({"current": {"temperature_2m": 20.0, "relative_humidity_2m": 85}}) is None
+
+
+# --- MeteoBelgie: observation time from the page header ---
+
+def test_station_time_is_converted_from_summer_time():
+    text = "Station van Sint-Niklaas Overzicht van 04-08-2026 om 13:10 Temperatuur : 31.5 °C"
+    assert parse_meteobelgie_observed_at(text) == STATION_TIME
+
+
+def test_station_time_is_converted_from_winter_time():
+    text = "Overzicht van 09-11-2026 om 20:11"
+    assert parse_meteobelgie_observed_at(text) == datetime(2026, 11, 9, 19, 11, tzinfo=timezone.utc)
+
+
+def test_station_time_missing_or_invalid_is_none():
+    assert parse_meteobelgie_observed_at("Overzicht van vandaag") is None
+    assert parse_meteobelgie_observed_at("Overzicht van 31-02-2026 om 10:00") is None
+
+
+def test_station_point_carries_observation_time():
+    assert stamp(build_meteobelgie_point(station())) == STATION_TIME
 
 
 # --- build_points: all sources in one cycle ---
@@ -109,8 +159,8 @@ def sources(**overrides):
             "storage_pools": [{"name": "local", "used": 0.4}],
         },
         huawei_raw={hrn.ACTIVE_POWER: 4200},
-        outdoor_raw={"current": {"temperature_2m": 20.0, "relative_humidity_2m": 85}},
-        meteobelgie_raw={"temp_c": 20.4, "humidity_pct": 84.9, "pressure_hpa": 1012, "dewpoint_c": 17.8},
+        outdoor_raw=open_meteo(temp=20.0, rh=85),
+        meteobelgie_raw=station(),
     )
     base.update(overrides)
     return base
@@ -146,3 +196,10 @@ def test_build_points_writes_nibe_scaled_value():
     assert nibe[1] == {"id": "40004"}
     assert nibe[2]["scaled_value"] == 21.5
     assert nibe[2]["is_valid"] is True
+
+
+def test_build_points_stamps_devices_with_cycle_time_and_weather_with_its_own():
+    stamps = {parse(p)[0]: stamp(p) for p in build_points(**sources(), ts=TS)}
+    assert stamps.pop("outdoor_weather") == OPEN_METEO_TIME
+    assert stamps.pop("meteobelgie_sint_niklaas") == STATION_TIME
+    assert set(stamps.values()) == {TS}
