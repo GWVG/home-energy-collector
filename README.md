@@ -43,7 +43,7 @@ Each cycle, `collector.py`:
 4. Flattens every response into InfluxDB points with one generic function, `to_points()`, that knows no field names. Numeric-keyed dicts and lists become one point per entity, nested dicts become path-joined field names, strings become tags and numbers become float fields. A few explicit, documented exceptions handle protocol quirks (NIBE's sentinel value and divisor, Huawei's datetime and flag types, smartctl's per-run timestamp string). The two weather sources are built by hand with chosen field names.
 5. Writes all points in one synchronous call, then sleeps until the next cycle. Cycles start `COLLECTOR_INTERVAL` apart on the monotonic clock, so fetch time doesn't stretch the interval.
 
-[`downsample.flux`](downsample.flux) is the InfluxDB task that rolls the raw data up into 15-minute means for the long term. It works on an allowlist of numeric fields, because Flux's `mean()` fails on strings and booleans.
+[`downsample.flux`](downsample.flux) is the InfluxDB task that rolls the raw data up into 15-minute means for the long term. It aggregates only numeric fields, selected by type (`types.isNumeric()`), because `mean()` fails on strings and booleans. New numeric fields are picked up without a change to the task.
 
 ## Running it
 
