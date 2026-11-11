@@ -15,7 +15,7 @@ This repository is the collector extracted from a larger homelab setup. Dashboar
 | Duco ventilation | HTTP REST, no auth | 60 s |
 | Huawei SUN2000 inverter | Modbus TCP via the SDongleA ([`huawei-solar`](https://pypi.org/project/huawei-solar/)) | 60 s |
 | Proxmox host health | HTTP, [`health_endpoint.py`](health_endpoint.py) on the host | 60 s |
-| Open-Meteo | Public HTTPS API, no key | 15 min, cached between fetches |
+| Open-Meteo | Public HTTPS API, no key | 5 min (15-minute data), cached between fetches |
 | MeteoBelgie station | Scraped web page | 1 h, cached between fetches |
 
 No vendor cloud accounts or apps are involved: every device is polled directly on the local network.

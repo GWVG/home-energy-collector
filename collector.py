@@ -61,7 +61,10 @@ INTERVAL = int(os.environ.get("COLLECTOR_INTERVAL", "60"))
 # Open-Meteo (model data) and a real station in Sint-Niklaas as a cross-check.
 OPEN_METEO_LAT = float(os.environ["OPEN_METEO_LAT"])
 OPEN_METEO_LON = float(os.environ["OPEN_METEO_LON"])
-OUTDOOR_WEATHER_INTERVAL = int(os.environ.get("OUTDOOR_WEATHER_INTERVAL", "900"))  # 15 min
+# Open-Meteo's data has 15-minute resolution, but `current` updates shortly
+# after each quarter hour. Polling every 15 min sometimes lands just before
+# the update and skips a quarter; every 5 min catches each one at least once.
+OUTDOOR_WEATHER_INTERVAL = int(os.environ.get("OUTDOOR_WEATHER_INTERVAL", "300"))  # 5 min
 
 # MeteoBelgie has no API, so this scrapes an ordinary web page: once an hour,
 # with an honest User-Agent, on a path robots.txt allows.
